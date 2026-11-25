@@ -163,6 +163,47 @@ is_kept() {
   return 1
 }
 
+# Hide what looks like a password, token or key in command lines (stdin to stdout, the first field kept as
+# is): --password X, --token=X, API_KEY=X, Authorization: Bearer X, user:pass@ in URLs, ?token=X, mysql -pX,
+# redis-cli -a X, sshpass -p X, and long random-looking strings. The preview and the log are read back
+# into the assistant's conversation, so secrets must not reach them.
+redact_secrets() {
+  awk '
+    function secret(k) {
+      k = tolower(k); sub(/^-+/, "", k)
+      return k ~ /^([a-z0-9]+[-_])*(pass|password|passwd|pwd|token|secret|api[-_]?key|apikey|access[-_]?key|auth|credentials?)$/
+    }
+    function query(w,   q, n, p, j, e, out) {
+      q = index(w, "?"); if (q == 0) return w
+      n = split(substr(w, q + 1), p, "&"); out = substr(w, 1, q)
+      for (j = 1; j <= n; j++) {
+        e = index(p[j], "=")
+        if (e > 0 && secret(substr(p[j], 1, e - 1))) p[j] = substr(p[j], 1, e) "***"
+        out = out (j > 1 ? "&" : "") p[j]
+      }
+      return out
+    }
+    {
+      n = split($0, f, " "); out = f[1]; hide = 0; auth = 0; db = ($0 ~ /mysql|mariadb/); short = ($0 ~ /redis-cli/ ? "-a" : ($0 ~ /sshpass/ ? "-p" : ""))
+      for (i = 2; i <= n; i++) {
+        w = f[i]; lw = tolower(w)
+        if (hide) { w = "***"; hide = 0 }
+        else if (auth) { auth = 0; if (lw ~ /^(bearer|basic|token|digest)$/) hide = 1; else w = "***" }
+        else if (lw == "authorization:" || lw == "bearer") { if (lw == "bearer") hide = 1; else auth = 1 }
+        else if (w ~ /^-/ && index(w, "=") == 0 && secret(w)) hide = 1
+        else if (w ~ /^-?-?[A-Za-z_][A-Za-z0-9_-]*=/ && secret(substr(w, 1, index(w, "=") - 1))) w = substr(w, 1, index(w, "=")) "***"
+        else if (db && w ~ /^-p[^0-9-]/) w = "-p***"
+        else if (short != "" && w == short) hide = 1
+        if (match(w, /:\/\/[^\/:@]+:[^\/@]+@/)) w = substr(w, 1, RSTART + 2) "***:***@" substr(w, RSTART + RLENGTH)
+        w = query(w)
+        if (length(w) >= 32 && w !~ /[\/.]/ && w ~ /[0-9]/ && w ~ /[A-Za-z]/) w = "***"
+        out = out " " w
+      }
+      print out
+    }
+  '
+}
+
 # The processes running inside an app (its descendants), for the log.
 proc_tree() {
   ps -axo pid=,ppid=,command= | awk -v root="$1" '
@@ -171,7 +212,7 @@ proc_tree() {
       inset[root] = 1; changed = 1
       while (changed) { changed = 0; for (p in par) if (!(p in inset) && (par[p] in inset)) { inset[p] = 1; changed = 1 } }
       for (p in inset) if (p != root) print p " " substr(cmd[p], 1, 150)
-    }' | sort -n | head -25
+    }' | sort -n | head -25 | redact_secrets
 }
 
 quit_app_async() {   # bundle id (or name), seconds

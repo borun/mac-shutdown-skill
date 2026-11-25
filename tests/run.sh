@@ -102,6 +102,30 @@ sleep 30 & child=$!
 contains "proc_tree lists child processes" "sleep 30" "$(proc_tree $$)"
 kill "$child" 2>/dev/null; wait "$child" 2>/dev/null
 
+# ---------------------------------------------------------------- secrets in command lines
+r=$(printf '%s\n' \
+  "1 mysql -uroot -pS3cret appdb" \
+  "2 psql postgres://app:hunter2@db:5432/app" \
+  "3 curl -H Authorization: Bearer abc.def https://api.example.com" \
+  "4 env GITHUB_TOKEN=ghp_abc npm publish" \
+  "5 tool --api-key=sk-123 --password hunter2 --port 8080" \
+  "6 curl https://x.com/a?api_key=abc&page=2" \
+  "7 redis-cli -a SuperSecret" \
+  "8 ./deploy aB3dE5fG7hI9jK1lM3nO5pQ7rS9tU1vW3xY5z" \
+  "9 docker run -p 8080:80 nginx --bypass cache" | redact_secrets)
+for secret in S3cret hunter2 abc.def ghp_abc sk-123 "api_key=abc" SuperSecret aB3dE5fG7hI9; do
+  lacks "command lines hide: $secret" "$secret" "$r"
+done
+contains "the URL keeps its host" "postgres://***:***@db:5432/app" "$r"
+contains "ordinary flags are kept" "docker run -p 8080:80 nginx --bypass cache" "$r"
+contains "other query parameters are kept" "page=2" "$r"
+bash -c 'sleep 30; :' --password hunter2 & child=$!
+sleep 1
+out=$(proc_tree $$)
+contains "proc_tree shows the job" "--password ***" "$out"
+lacks "but not its password" "hunter2" "$out"
+kill "$child" 2>/dev/null; wait "$child" 2>/dev/null
+
 # ---------------------------------------------------------------- ending processes
 # Short sleeps, so no orphaned child keeps the output open once the dummy is killed.
 bash -c 'trap "" TERM; while :; do sleep 1; done' & stubborn=$!

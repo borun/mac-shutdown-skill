@@ -1,0 +1,15 @@
+{
+  "name": "mac-shutdown-skill",
+  "description": "Shut a Mac down gracefully once your coding agent has finished its work: stops Docker, saves drafts, closes what blocks, sleeps as a last resort.",
+  "owner": {
+    "name": "Md Abdullah Al Farooq",
+    "url": "https://github.com/borun"
+  },
+  "plugins": [
+    {
+      "name": "mac-shutdown",
+      "source": "./",
+      "description": "Graceful, unattended Mac shutdown after your agent's work or at a set time, with a cancellable warning, saved drafts, a full log and a sleep fallback."
+    }
+  ]
+}

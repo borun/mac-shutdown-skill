@@ -1,0 +1,12 @@
+{
+  "name": "mac-shutdown",
+  "description": "Graceful, unattended Mac shutdown after your agent's work or at a set time, with a cancellable warning, saved drafts, a full log and a sleep fallback.",
+  "author": {
+    "name": "Md Abdullah Al Farooq",
+    "url": "https://github.com/borun"
+  },
+  "homepage": "https://github.com/borun/mac-shutdown-skill",
+  "repository": "https://github.com/borun/mac-shutdown-skill",
+  "license": "MIT",
+  "keywords": ["macos", "shutdown", "automation", "docker", "agent-skill"]
+}

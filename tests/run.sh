@@ -15,7 +15,7 @@
 
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
-SCRIPT="$HERE/../scripts/mac_shutdown.sh"
+SCRIPT="$HERE/../skills/mac-shutdown/scripts/mac_shutdown.sh"
 
 # ---------------------------------------------------------------- fakes
 FAKE_OSA_OUT=""
@@ -30,7 +30,7 @@ export MAC_SHUTDOWN_STATE_DIR="$STATE"
 touch "$STATE/REHEARSAL"
 trap 'rm -rf "$STATE"' EXIT
 
-# shellcheck source=../scripts/mac_shutdown.sh
+# shellcheck source=../skills/mac-shutdown/scripts/mac_shutdown.sh
 MAC_SHUTDOWN_LIB=1 . "$SCRIPT"
 set +e   # the script sets -u only; keep going after a failed check
 LOG="$STATE/test.log"

@@ -27,6 +27,7 @@ caffeinate() { return 0; }
 
 STATE="$(mktemp -d -t mac-shutdown-tests)"
 export MAC_SHUTDOWN_STATE_DIR="$STATE"
+export MAC_SHUTDOWN_CONFIG="$STATE/config"   # never the real one; created only by the config tests
 touch "$STATE/REHEARSAL"
 trap 'rm -rf "$STATE"' EXIT
 
@@ -264,6 +265,26 @@ check "cancel leaves a note for the worker's log" yes "$( [ -f "$CANCEL_MARK" ] 
 check "and clears the schedule" no "$( [ -f "$PID_FILE" ] && echo yes || echo no )"
 rm -f "$CANCEL_MARK"; wait "$worker_dummy" 2>/dev/null
 
+# ---------------------------------------------------------------- config file and doctor
+printf '%s\n' "# my defaults" "in = 5m" "warn=10" "keep=Music" "keep = Spotify" "no_kill=yes" "save_dir=~/Drafts" > "$CONFIG_FILE"
+got=$( parse_opts; printf '%s|%s|%s|%s|%s' "$OPT_DELAY" "$OPT_WARN" "$KEEP" "$OPT_KILL" "$OPT_SAVE_DIR" )
+check "the config file sets the defaults" "300|10||Music|Spotify|0|$HOME/Drafts" "$got"
+got=$( parse_opts --warn 30 --kill --keep Mail; printf '%s|%s|%s' "$OPT_WARN" "$OPT_KILL" "$KEEP" )
+check "flags win over the config file, and --keep adds to it" "30|1||Music|Spotify|Mail" "$got"
+printf '%s\n' "warn=soon" > "$CONFIG_FILE"
+( parse_opts ) >/dev/null 2>&1; check "a bad value in the config is refused" 2 "$?"
+printf '%s\n' "colour=blue" > "$CONFIG_FILE"
+contains "an unknown setting is named" "unknown setting 'colour'" "$( ( parse_opts ) 2>&1 )"
+rm -f "$CONFIG_FILE"
+FAKE_OSA_OUT="312"; FAKE_OSA_RC=0
+out=$(HOST_NAME=Claude HOST_ID=com.anthropic.claudefordesktop cmd_doctor 2>&1)
+contains "doctor names the assistant's app" "Assistant app:  Claude (com.anthropic.claudefordesktop)" "$out"
+contains "doctor checks Automation" "System Events can be controlled" "$out"
+contains "doctor reports the rehearsal switch" "REHEARSAL MODE is on" "$out"
+FAKE_OSA_OUT="execution error: Not authorized to send Apple events to System Events. (-1743)"; FAKE_OSA_RC=1
+contains "doctor explains a missing permission" "Allow Claude to control System Events" "$(HOST_NAME=Claude HOST_ID=x cmd_doctor 2>&1)"
+FAKE_OSA_OUT=""; FAKE_OSA_RC=0
+
 # ---------------------------------------------------------------- the command line, as a separate process
 # Each of these is rejected before anything starts; REHEARSAL in the state folder is a second guard.
 for args in "--in 5x" "--at 25:00" "--warn abc" "--after-pid abc" "--late-limit 1x" "--bogus"; do
@@ -276,6 +297,7 @@ contains "status with nothing scheduled" "No shutdown is scheduled." "$(/bin/bas
 contains "status shows the rehearsal switch" "REHEARSAL MODE is on" "$(/bin/bash "$SCRIPT" status)"
 contains "cancel with nothing scheduled" "No shutdown is scheduled." "$(/bin/bash "$SCRIPT" cancel)"
 contains "help shows the commands" "mac_shutdown.sh schedule [options]" "$(/bin/bash "$SCRIPT" help)"
+contains "version" "mac-shutdown 2." "$(/bin/bash "$SCRIPT" version)"
 
 # ---------------------------------------------------------------- summary
 echo

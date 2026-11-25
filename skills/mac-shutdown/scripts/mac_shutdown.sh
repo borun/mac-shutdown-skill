@@ -6,6 +6,7 @@
 #   mac_shutdown.sh cancel                             stop a scheduled shutdown
 #   mac_shutdown.sh status                             is one scheduled? when? which log?
 #   mac_shutdown.sh last                               the latest run's log, and when the Mac last started
+#   mac_shutdown.sh doctor                             read-only check of what the script needs
 #
 # schedule options:
 #   --in DURATION     wait this long first: 90s, 5m, 2h (default 2m, so Claude's last reply can finish)
@@ -14,11 +15,15 @@
 #   --warn SECONDS    on-screen warning with a Cancel button before anything happens (default 60; 0 = none)
 #   --keep APP        never quit or end this app (its name or bundle id); repeatable
 #   --no-kill         never force anything closed; if macOS refuses to shut down, sleep instead
+#   --kill            force-close apps that refuse, even if the config file says no_kill=yes
 #   --late-limit DUR  skip the shutdown if the run only gets going this long after its start time,
 #                     e.g. the Mac slept through it (default 30m; 0 = never skip)
 #   --save-dir DIR    where never-saved drafts go (default ~/Documents/Saved before shutdown/<time>)
 #   --dry-run         run every step now, in the foreground, read-only, printing what it would do
 #   --replace         cancel an already scheduled shutdown first
+#
+# Defaults can be set in ~/.config/mac-shutdown/config, one per line (flags win):
+#   in=2m  warn=60  late_limit=30m  no_kill=yes|no  save_dir=~/path  keep=App (repeatable)
 #
 # The ladder, once the wait is over:
 #   warning with Cancel -> stop Docker/OrbStack/Colima -> save drafts in TextEdit, Pages, Numbers, Keynote
@@ -34,7 +39,9 @@ set -u
 PATH="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
 export PATH
 
+VERSION=2.0.0
 STATE_DIR="${MAC_SHUTDOWN_STATE_DIR:-$HOME/Library/Logs/mac-shutdown}"
+CONFIG_FILE="${MAC_SHUTDOWN_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/mac-shutdown/config}"
 PID_FILE="$STATE_DIR/scheduled.pid"
 INFO_FILE="$STATE_DIR/scheduled.txt"
 CANCEL_MARK="$STATE_DIR/cancel-requested"
@@ -788,7 +795,41 @@ scheduled_pid() {   # prints the worker pid if one is alive
 }
 
 OPT_LATE=1800 OPT_DELAY=120 OPT_AT="" OPT_AT_EPOCH="" OPT_AFTER_PID="" OPT_WARN=60 OPT_KILL=1 OPT_SAVE_DIR="" OPT_DRY=0 OPT_REPLACE=0
+
+# Defaults from the config file: key=value lines, # for comments. Flags given on the command line win.
+load_config() {
+  local line key value n=0
+  [ -f "$CONFIG_FILE" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n + 1))
+    line=${line%%#*}
+    case "$line" in
+      *=*) ;;
+      *[![:space:]]*) die "$CONFIG_FILE line $n: expected key=value, got: $line" ;;
+      *) continue ;;
+    esac
+    key=$(printf '%s' "${line%%=*}" | tr -d '[:space:]')
+    value=$(printf '%s' "${line#*=}" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+    case "$key" in
+      in) OPT_DELAY=$(parse_duration "$value") || exit 2 ;;
+      warn) case "$value" in ''|*[!0-9]*) die "$CONFIG_FILE line $n: warn needs a number of seconds" ;; esac
+            OPT_WARN=$value ;;
+      late_limit) OPT_LATE=$(parse_duration "$value") || exit 2 ;;
+      keep) if [ -n "$value" ]; then KEEP="$KEEP|$value"; fi ;;
+      no_kill) case "$value" in
+                 yes|true|1) OPT_KILL=0 ;;
+                 no|false|0) OPT_KILL=1 ;;
+                 *) die "$CONFIG_FILE line $n: no_kill is yes or no" ;;
+               esac ;;
+      save_dir) case "$value" in "~"/*) value="$HOME/${value#"~/"}" ;; esac
+                OPT_SAVE_DIR=$value ;;
+      *) die "$CONFIG_FILE line $n: unknown setting '$key' (use in, warn, late_limit, keep, no_kill or save_dir)" ;;
+    esac
+  done < "$CONFIG_FILE"
+}
+
 parse_opts() {
+  load_config
   while [ $# -gt 0 ]; do
     case "$1" in
       --in) OPT_DELAY=$(parse_duration "${2:?--in needs a value}") || exit 2; shift ;;
@@ -797,6 +838,7 @@ parse_opts() {
       --warn) OPT_WARN="${2:?--warn needs a value}"; shift ;;
       --keep) KEEP="$KEEP|${2:?--keep needs a value}"; shift ;;
       --no-kill) OPT_KILL=0 ;;
+      --kill) OPT_KILL=1 ;;
       --late-limit) OPT_LATE=$(parse_duration "${2:?--late-limit needs a value}") || exit 2; shift ;;
       --save-dir) OPT_SAVE_DIR="${2:?--save-dir needs a value}"; shift ;;
       --dry-run) OPT_DRY=1 ;;
@@ -942,6 +984,7 @@ cmd_preview() {
   set_host
   say "PREVIEW (read-only; nothing is changed)"
   say "This assistant runs in: ${HOST_NAME:-(could not tell: not inside an app, e.g. tmux or ssh)}"
+  if [ -f "$CONFIG_FILE" ]; then say "Defaults from: $CONFIG_FILE"; fi
   [ -f "$REHEARSAL_FILE" ] && say "!! REHEARSAL MODE is on ($REHEARSAL_FILE): schedules will be dry runs."
   if scheduled_pid >/dev/null; then say "!! A shutdown is already scheduled:"; sed 's/^/   /' "$INFO_FILE" 2>/dev/null; fi
   users=$(who | awk '{print $1}' | sort -u | paste -sd, -)
@@ -996,6 +1039,44 @@ EOF
   say "If macOS still refuses after the apps are ended, the Mac is put to sleep instead."
 }
 
+# Read-only: is everything the script needs in place? It may make macOS ask for permission to control
+# System Events, which is what preview does too, so that nobody has to answer it at night.
+cmd_doctor() {
+  local missing="" tool out users idle
+  set_host
+  say "mac-shutdown $VERSION · $(sw_vers -productName 2>/dev/null) $(sw_vers -productVersion 2>/dev/null) · bash $BASH_VERSION"
+  say "Script:         $SELF"
+  say "Assistant app:  ${HOST_NAME:-could not tell (not inside an app, e.g. tmux or ssh)}${HOST_ID:+ ($HOST_ID)}"
+  for tool in osascript caffeinate pmset /usr/bin/perl /usr/bin/nohup /usr/libexec/PlistBuddy; do
+    command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
+  done
+  if [ -z "$missing" ]; then say "Tools:          all present"
+  else say "Tools:          MISSING:$missing (schedule needs /usr/bin/perl and nohup to detach the worker)"; fi
+  out=$(with_timeout 30 osascript -e 'tell application "System Events" to count processes' 2>&1)
+  case "$out" in
+    *-1743*) say "Automation:     NOT ALLOWED. Allow ${HOST_NAME:-the app your assistant runs in} to control System Events in System Settings > Privacy & Security > Automation" ;;
+    *[0-9]*) case "$out" in *[!0-9]*) say "Automation:     unexpected answer from System Events: $out" ;;
+                            *) say "Automation:     System Events can be controlled (needed to list apps and shut down)" ;; esac ;;
+    *) say "Automation:     no answer from System Events: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-160)" ;;
+  esac
+  users=$(who | awk '{ print $1 }' | sort -u | paste -sd, -)
+  case "$users" in *,*) say "Users:          $users: more than one is logged in, so macOS wants an admin password and the Mac will sleep instead" ;;
+                   *) say "Users:          $users" ;; esac
+  if ! command -v docker >/dev/null 2>&1; then say "Docker:         not installed"
+  elif docker_running; then say "Docker:         Docker Desktop is running; it is stopped gracefully first"
+  else say "Docker:         installed, not running"; fi
+  idle=$(pmset -g 2>/dev/null | awk '$1 == "sleep" { print $2; exit }')
+  say "Idle sleep:     ${idle:-?} min (held off while a shutdown waits)"
+  if [ -f "$CONFIG_FILE" ]; then
+    if out=$( (load_config) 2>&1 ); then say "Config:         $CONFIG_FILE (valid)"
+    else say "Config:         $CONFIG_FILE has a problem: $out"; fi
+  else say "Config:         none (optional: $CONFIG_FILE)"; fi
+  say "Logs:           $STATE_DIR"
+  if scheduled_pid >/dev/null; then say "Scheduled:      yes (see: $(basename "$SELF") status)"; else say "Scheduled:      no"; fi
+  if [ -f "$REHEARSAL_FILE" ]; then say "!! REHEARSAL MODE is on ($REHEARSAL_FILE): schedules are dry runs."; fi
+  return 0
+}
+
 # Tests source this file with MAC_SHUTDOWN_LIB=1 to load the functions without running a command.
 if [ "${MAC_SHUTDOWN_LIB:-0}" = 1 ]; then return 0 2>/dev/null || exit 0; fi
 
@@ -1005,9 +1086,11 @@ case "${1:-help}" in
   cancel) cmd_cancel ;;
   status) cmd_status ;;
   last) cmd_last ;;
+  doctor) cmd_doctor ;;
+  version|--version) say "mac-shutdown $VERSION" ;;
   _worker) worker ;;
   _docs) shift; run_docs "$@" ;;   # testing: _docs <bundle id> list|save <app name> <dir> [only this document]
   _warn) MS_WARN="${2:-5}"; phase_warn; echo "(the warning returned; a real run would carry on)" ;;   # testing
   help|-h|--help) usage ;;
-  *) die "unknown command: $1 (preview, schedule, cancel, status, last)" ;;
+  *) die "unknown command: $1 (preview, schedule, cancel, status, last, doctor)" ;;
 esac

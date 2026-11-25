@@ -14,7 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: ShellCheck
-        run: shellcheck --severity=warning scripts/mac_shutdown.sh tests/run.sh
+        run: shellcheck --severity=warning skills/mac-shutdown/scripts/mac_shutdown.sh tests/run.sh
 
   tests:
     # The script targets macOS's own bash 3.2, date and osascript.
@@ -22,6 +22,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Syntax with /bin/bash
-        run: /bin/bash -n scripts/mac_shutdown.sh && /bin/bash -n tests/run.sh
+        run: /bin/bash -n skills/mac-shutdown/scripts/mac_shutdown.sh && /bin/bash -n tests/run.sh
       - name: Unit tests
         run: /bin/bash tests/run.sh

@@ -79,7 +79,7 @@ done
 
 # ---------------------------------------------------------------- app kinds and --keep
 check "Finder is left to macOS" finder "$(app_kind com.apple.finder)"
-check "the Claude app" claude "$(app_kind com.anthropic.claudefordesktop)"
+check "the Claude app is an assistant host" host "$(app_kind com.anthropic.claudefordesktop)"
 check "Terminal" terminal "$(app_kind com.apple.Terminal)"
 check "iTerm2" terminal "$(app_kind com.googlecode.iterm2)"
 check "TextEdit saves drafts" doc "$(app_kind com.apple.TextEdit)"
@@ -142,7 +142,7 @@ contains "the default grace is 15 s" "it has 15s to close by itself" "$out"
 lacks "a process that exits on TERM gets no KILL" "sending KILL" "$out"
 if [ $(( $(date +%s) - start )) -le 4 ]; then ok "and it is not kept waiting"; else bad "and it is not kept waiting" "took $(( $(date +%s) - start )) s"; fi
 wait "$polite" 2>/dev/null
-check "the Claude app gets longer before KILL" 45 "$CLAUDE_TERM_GRACE"
+check "the assistant's app gets longer before KILL" 45 "$HOST_TERM_GRACE"
 
 # ---------------------------------------------------------------- Docker notes
 N=$(date +%s)
@@ -191,6 +191,78 @@ out=$(log_since "$n")
 contains "a run that can only start 2 h late is skipped" "SKIPPED: the run only got going 120 min after its start time" "$out"
 lacks "and nothing else happens" "carried on" "$out"
 check "an on-time run arms the sleep guard" "GUARD=1" "$( ( DRY=1; MS_AFTER_PID=""; MS_DELAY=0; MS_LATE=1800; MS_TARGET=$(date +%s); phase_wait; echo "GUARD=$GUARD" ) | tail -n 1)"
+
+# ---------------------------------------------------------------- the app the assistant runs in
+mkdir -p "$STATE/Apps/Claude.app" "$STATE/Lib/claude-code/claude.app" "$STATE/Apps/Visual Studio Code.app"
+# Fake process tables ("PPID executable" per pid). Defined here, not inside $( ), which bash 3.2 can't
+# parse with a case statement in it.
+fake_app_info() { printf 'id.%s\t%s\n' "$(basename "$1" .app | tr ' ' '-')" "$(basename "$1" .app)"; }
+chain_claude() {
+  case "$1" in
+    300) echo "200 /bin/zsh" ;;
+    200) echo "100 $STATE/Lib/claude-code/claude.app/Contents/MacOS/claude" ;;
+    100) echo "1 $STATE/Apps/Claude.app/Contents/MacOS/Claude" ;;
+  esac
+}
+chain_vscode() {
+  case "$1" in
+    300) echo "200 /bin/zsh" ;;
+    200) echo "1 $STATE/Apps/Visual Studio Code.app/Contents/Frameworks/Code Helper.app/Contents/MacOS/Code Helper" ;;
+  esac
+}
+chain_tmux() {
+  case "$1" in
+    300) echo "200 /bin/zsh" ;;
+    200) echo "1 /usr/bin/tmux" ;;
+  esac
+}
+host=$( proc_info() { chain_claude "$@"; }; app_info() { fake_app_info "$@"; }; detect_host 300 )
+check "the highest app in the process chain is the host, not a tool's own bundle" "id.Claude${TAB}Claude" "$host"
+host=$( proc_info() { chain_vscode "$@"; }; app_info() { fake_app_info "$@"; }; detect_host 300 )
+check "a helper inside an app counts as the app (and names with spaces work)" "id.Visual-Studio-Code${TAB}Visual Studio Code" "$host"
+host=$( proc_info() { chain_tmux "$@"; }; detect_host 300 )
+check "no app in the chain (tmux, ssh): no host" "" "$host"
+check "the detected host is quit last" host "$( HOST_ID=com.todesktop.cursor; app_kind com.todesktop.cursor )"
+check "a terminal that hosts the session is still handled as a terminal" terminal "$( HOST_ID=com.apple.Terminal; app_kind com.apple.Terminal )"
+
+# ---------------------------------------------------------------- AppleScript gets names as arguments
+( osascript() { printf '%s\n' "$@" > "$STATE/osa-args"; }; quit_app_async 'Odd "Name" App' 10; wait )
+check "an app name is passed as one argument, never pasted into the script" 1 "$(grep -c 'Odd' "$STATE/osa-args")"
+contains "and arrives intact" 'Odd "Name" App' "$(tail -n 1 "$STATE/osa-args")"
+n=$(log_lines)
+( osascript() { printf '%s\n' "$@" > "$STATE/osa-args"; echo "button returned:, gave up:true"; }
+  HOST_NAME=Cursor; MS_WARN=5; DRY=0; phase_warn )
+contains "the warning names the assistant's app" "as you asked your assistant in Cursor." "$(cat "$STATE/osa-args")"
+contains "and an unanswered warning carries on" "nobody answered the warning; carrying on" "$(log_since "$n")"
+
+# ---------------------------------------------------------------- ending apps: --keep and --no-kill
+sleep 60 & dummy=$!
+sleep 60 & kept=$!
+n=$(log_lines)
+( list_apps() { printf 'Dummy\t%s\tcom.example.dummy\nKept\t%s\tcom.example.kept\n' "$dummy" "$kept"; }
+  DRY=0; MS_KILL=1; KEEP="|Kept"; TERM_GRACE=2; GUARD=0; phase_force )
+out=$(log_since "$n")
+if alive "$dummy"; then bad "an app that refused is ended" "pid $dummy is alive"; else ok "an app that refused is ended"; fi
+if alive "$kept"; then ok "a --keep app is never ended"; else bad "a --keep app is never ended" "pid $kept was ended"; fi
+contains "and the log says so" "Kept: kept (--keep); not ended" "$out"
+n=$(log_lines)
+( list_apps() { printf 'Kept\t%s\tcom.example.kept\n' "$kept"; }; DRY=0; MS_KILL=0; GUARD=0; phase_force )
+contains "--no-kill ends nothing" "--no-kill: nothing is forced closed" "$(log_since "$n")"
+if alive "$kept"; then ok "and the app is still running"; else bad "and the app is still running" "pid $kept was ended"; fi
+kill "$kept" 2>/dev/null; wait "$dummy" "$kept" 2>/dev/null
+
+# ---------------------------------------------------------------- cancelling a running worker
+# A dummy whose command line contains "mac_shutdown", as the real worker's does. Short sleeps, so
+# nothing it leaves behind keeps the output open.
+bash -c 'while :; do sleep 1; done' mac_shutdown_dummy >/dev/null 2>&1 & worker_dummy=$!
+sleep 1
+printf '%s %s\n' "$worker_dummy" "$(ps -o pgid= -p $$ | tr -d ' ')" > "$PID_FILE"
+out=$(cmd_cancel 2>&1)
+contains "cancel ends a scheduled worker" "Cancelled the scheduled shutdown (worker $worker_dummy)" "$out"
+if alive "$worker_dummy"; then bad "the worker is gone after cancel" "pid $worker_dummy is alive"; kill -KILL "$worker_dummy"; else ok "the worker is gone after cancel"; fi
+check "cancel leaves a note for the worker's log" yes "$( [ -f "$CANCEL_MARK" ] && echo yes || echo no )"
+check "and clears the schedule" no "$( [ -f "$PID_FILE" ] && echo yes || echo no )"
+rm -f "$CANCEL_MARK"; wait "$worker_dummy" 2>/dev/null
 
 # ---------------------------------------------------------------- the command line, as a separate process
 # Each of these is rejected before anything starts; REHEARSAL in the state folder is a second guard.

@@ -45,7 +45,8 @@ SELF="$SELF_DIR/$(basename "$0")"
 TAB="$(printf '\t')"
 
 TERMINAL_IDS="com.apple.Terminal com.googlecode.iterm2 dev.warp.Warp-Stable dev.warp.Warp com.mitchellh.ghostty org.alacritty io.alacritty net.kovidgoyal.kitty com.github.wez.wezterm co.zeit.hyper org.tabby"
-CLAUDE_IDS="com.anthropic.claudefordesktop com.anthropic.claude"
+# Apps that host an assistant session: always quit last. The app this session runs in is added at run time.
+KNOWN_HOST_IDS="com.anthropic.claudefordesktop com.anthropic.claude"
 DOC_IDS="com.apple.TextEdit com.apple.Pages com.apple.iWork.Pages com.apple.Numbers com.apple.iWork.Numbers com.apple.Keynote com.apple.iWork.Keynote"
 ENGINE_IDS="com.electron.dockerdesktop com.docker.docker dev.kdrag0n.MacVirt"
 NEVER_IDS="com.apple.finder"
@@ -53,13 +54,15 @@ NEVER_IDS="com.apple.finder"
 SHUTDOWN_GRACE=150   # seconds to wait for macOS after asking it to shut down
 QUIT_GRACE=60        # seconds for apps to quit after being asked
 TERM_GRACE=15        # seconds between TERM and KILL
-CLAUDE_TERM_GRACE=45 # the Claude app winds its sessions down, so it gets longer before KILL
+HOST_TERM_GRACE=45   # the assistant's app (e.g. Claude) winds its sessions down, so it gets longer before KILL
 SLEEP_GAP=90         # a pause that overruns by this much means the Mac slept (caffeinate only stops idle sleep)
 
 LOG=""
 ECHO=1
 DRY=0
 GUARD=0              # 1 once the shutdown steps have begun: from then on, a sleep stops the run
+HOST_ID=${MS_HOST_ID:-}     # the app this assistant session runs in (set_host), passed on to the worker
+HOST_NAME=${MS_HOST_NAME:-}
 SLEPT_MARK="$STATE_DIR/slept-during-run"
 
 # ---------------------------------------------------------------- helpers
@@ -129,6 +132,45 @@ with_timeout() {
   wait "$pid"
 }
 
+proc_info() { ps -o ppid=,comm= -p "$1" 2>/dev/null; }   # "PPID /path/to/executable"
+
+app_info() {   # .app folder -> bundle id<TAB>name
+  local plist="$1/Contents/Info.plist" id name
+  id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist" 2>/dev/null)
+  name=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$plist" 2>/dev/null ||
+         /usr/libexec/PlistBuddy -c 'Print :CFBundleName' "$plist" 2>/dev/null)
+  [ -n "$name" ] || name=$(basename "$1" .app)
+  printf '%s\t%s\n' "$id" "$name"
+}
+
+# The app this assistant session runs in (the Claude app, an IDE, a terminal): the highest ancestor
+# process that lives inside an .app bundle. Tools such as Claude Code may sit in their own bundle lower
+# down, so the highest one wins. Prints bundle id<TAB>name, or nothing (e.g. under tmux or ssh).
+detect_host() {
+  local pid=${1:-$$} line ppid comm app="" i=0
+  while [ $i -lt 50 ]; do
+    line=$(proc_info "$pid")
+    [ -n "$line" ] || break
+    ppid=$(printf '%s' "$line" | awk '{ print $1 }')
+    comm=$(printf '%s' "$line" | sed -E 's/^ *[0-9]+ //')
+    case "$comm" in
+      */*.app/Contents/*) if [ -d "${comm%%.app/Contents/*}.app" ]; then app="${comm%%.app/Contents/*}.app"; fi ;;
+    esac
+    case "$ppid" in ''|*[!0-9]*) break ;; esac
+    [ "$ppid" -gt 1 ] || break
+    pid=$ppid; i=$((i + 1))
+  done
+  if [ -n "$app" ]; then app_info "$app"; fi
+}
+
+set_host() {   # run in the assistant's own process (preview, schedule, doctor); the worker inherits the result
+  local info
+  [ -z "$HOST_ID$HOST_NAME" ] || return 0
+  info=$(detect_host)
+  HOST_ID=$(printf '%s' "$info" | cut -f1)
+  HOST_NAME=$(printf '%s' "$info" | cut -f2)
+}
+
 # Visible apps, one per line: name<TAB>pid<TAB>bundle id
 list_apps() {
   with_timeout 30 osascript \
@@ -144,8 +186,8 @@ list_apps() {
 app_kind() {
   local id=$1
   if in_list "$id" "$NEVER_IDS"; then echo finder
-  elif in_list "$id" "$CLAUDE_IDS"; then echo claude
   elif in_list "$id" "$TERMINAL_IDS"; then echo terminal
+  elif in_list "$id" "$KNOWN_HOST_IDS" || { [ -n "$HOST_ID" ] && [ "$id" = "$HOST_ID" ]; }; then echo host
   elif in_list "$id" "$DOC_IDS"; then echo doc
   elif in_list "$id" "$ENGINE_IDS"; then echo engine
   else echo other
@@ -215,11 +257,13 @@ proc_tree() {
     }' | sort -n | head -25 | redact_secrets
 }
 
-quit_app_async() {   # bundle id (or name), seconds
-  local target=$1 secs=$2 spec
-  if printf '%s' "$target" | grep -qE '^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$'; then spec="application id \"$target\""
-  else spec="application \"$target\""; fi
-  with_timeout "$secs" osascript -e "with timeout of $(( secs - 5 )) seconds" -e "tell $spec to quit" -e 'end timeout' >/dev/null 2>&1 &
+quit_app_async() {   # bundle id (or name), seconds. The target is passed as an argument, so any name is safe.
+  local target=$1 secs=$2 by=name
+  if printf '%s' "$target" | grep -qE '^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$'; then by=id; fi
+  with_timeout "$secs" osascript -e 'on run argv' -e "with timeout of $(( secs - 5 )) seconds" \
+    -e 'if item 1 of argv is "id" then' -e 'tell application id (item 2 of argv) to quit' \
+    -e 'else' -e 'tell application (item 2 of argv) to quit' -e 'end if' \
+    -e 'end timeout' -e 'end run' "$by" "$target" >/dev/null 2>&1 &
 }
 
 # TERM, wait, then KILL. Arguments: pid name [seconds to wait after TERM]
@@ -348,7 +392,7 @@ run_docs() {   # bundle id, list|save, display name, save dir [, only this docum
   rm -f "$f"
   if [ $rc -ne 0 ]; then
     case "$out" in
-      *-1743*) printf 'ERROR\t%s\t%s\n' "$name" "no permission to control $name: allow Claude in System Settings > Privacy & Security > Automation" ;;
+      *-1743*) printf 'ERROR\t%s\t%s\n' "$name" "no permission to control $name: allow ${HOST_NAME:-the app your assistant runs in} to control it in System Settings > Privacy & Security > Automation" ;;
       *) printf 'ERROR\t%s\t%s\n' "$name" "exit $rc: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200)" ;;
     esac
     return 1
@@ -474,12 +518,13 @@ phase_warn() {
   [ "$MS_WARN" -gt 0 ] || { log "no on-screen warning (--warn 0)"; return 0; }
   if [ "$DRY" = 1 ]; then log "[dry run] would show a ${MS_WARN}-second warning with a Cancel button"; return 0; fi
   log "showing a ${MS_WARN}-second warning with a Cancel button"
+  local msg="This Mac will shut down in $MS_WARN seconds, as you asked${HOST_NAME:+ your assistant in $HOST_NAME}. Drafts in TextEdit, Pages, Numbers and Keynote will be saved first; other apps are asked to quit."
   WARN_SHOWING=1
-  out=$(with_timeout $(( MS_WARN + 30 )) osascript \
+  out=$(with_timeout $(( MS_WARN + 30 )) osascript -e 'on run argv' \
     -e "with timeout of $(( MS_WARN + 20 )) seconds" \
     -e 'tell application "System Events"' -e 'activate' \
-    -e "display dialog \"This Mac will shut down in $MS_WARN seconds, as you asked Claude. Drafts in TextEdit, Pages, Numbers and Keynote will be saved first; other apps are asked to quit.\" with title \"Scheduled shutdown\" buttons {\"Cancel shutdown\", \"Shut down now\"} default button \"Shut down now\" cancel button \"Cancel shutdown\" with icon caution giving up after $MS_WARN" \
-    -e 'end tell' -e 'end timeout' 2>&1); rc=$?
+    -e "set r to display dialog (item 1 of argv) with title \"Scheduled shutdown\" buttons {\"Cancel shutdown\", \"Shut down now\"} default button \"Shut down now\" cancel button \"Cancel shutdown\" with icon caution giving up after $MS_WARN" \
+    -e 'end tell' -e 'end timeout' -e 'return r' -e 'end run' "$msg" 2>&1); rc=$?
   WARN_SHOWING=0
   case "$out" in
     *-128*) log "CANCELLED: 'Cancel shutdown' was clicked on the warning"; finish 0 ;;
@@ -566,7 +611,7 @@ phase_quit() {
   while IFS="$TAB" read -r name pid id; do
     [ -n "$name" ] || continue
     kind=$(app_kind "$id")
-    case "$kind" in finder|claude|terminal) continue ;; esac
+    case "$kind" in finder|host|terminal) continue ;; esac
     if is_kept "$name" "$id"; then log "$name: kept (--keep); not asked to quit"; continue; fi
     if [ "$DRY" = 1 ]; then log "[dry run] would ask $name to quit"; continue; fi
     log "asking $name to quit"
@@ -655,16 +700,16 @@ phase_force() {
     [ "$kind" = finder ] && continue
     if is_kept "$name" "$id"; then log "$name: kept (--keep); not ended"; continue; fi
     if [ "$DRY" = 1 ]; then
-      if [ "$kind" = claude ]; then log "[dry run] would ask the Claude app to quit, then end it if it refuses, allowing ${CLAUDE_TERM_GRACE}s after TERM (this closes every Claude session)"
+      if [ "$kind" = host ]; then log "[dry run] would ask $name, where the assistant runs, to quit, then end it if it refuses, allowing ${HOST_TERM_GRACE}s after TERM (this closes every session in it)"
       else log "[dry run] would end $name if it is still open (unsaved changes in it are lost)"; fi
       continue
     fi
-    if [ "$kind" = claude ]; then
-      log "asking the Claude app to quit (it usually refuses while shutting down)"
+    if [ "$kind" = host ]; then
+      log "asking $name, where the assistant runs, to quit (it often refuses while shutting down)"
       quit_app_async "$id" 25; nap 20
     fi
     if alive "$pid"; then
-      if [ "$kind" = claude ]; then end_process "$pid" "$name" "$CLAUDE_TERM_GRACE"
+      if [ "$kind" = host ]; then end_process "$pid" "$name" "$HOST_TERM_GRACE"
       else end_process "$pid" "$name"; fi
     fi
   done <<EOF
@@ -688,6 +733,7 @@ worker() {
     printf '%s %s\n' "$$" "$(ps -o pgid= -p $$ | tr -d ' ')" > "$PID_FILE"
   fi
   log "=== mac-shutdown worker started (pid $$)$( [ "$DRY" = 1 ] && printf ' DRY RUN: nothing will be changed' ) ==="
+  log "assistant app: ${HOST_NAME:-unknown} ${HOST_ID:+($HOST_ID)}"
   log "settings: force-close=$( [ "$MS_KILL" = 1 ] && echo yes || echo no) warning=${MS_WARN}s keep=[$(printf '%s' "${MS_KEEP#|}" | sed 's/|/, /g')]"
   phase_wait
   if [ -z "$MS_SAVE_DIR" ]; then   # named after the time the run starts (in a dry run, the planned start)
@@ -788,7 +834,8 @@ cmd_schedule() {
   case "$target" in ''|*[!0-9]*) die "could not work out the start time" ;; esac
   stamp=$(date +%Y%m%d-%H%M%S)
   export MS_TARGET=$target MS_DELAY=$OPT_DELAY MS_AFTER_PID=$OPT_AFTER_PID MS_WARN=$OPT_WARN MS_KILL=$OPT_KILL
-  export MS_KEEP=$KEEP MS_DRY=$OPT_DRY MS_LATE=$OPT_LATE
+  set_host
+  export MS_KEEP=$KEEP MS_DRY=$OPT_DRY MS_LATE=$OPT_LATE MS_HOST_ID=$HOST_ID MS_HOST_NAME=$HOST_NAME
   export MS_SAVE_DIR="$OPT_SAVE_DIR"   # empty: named when the run starts
 
   if [ "$OPT_DRY" = 1 ]; then
@@ -828,6 +875,7 @@ schedule_summary() {   # start epoch, worker text, log path
   echo "Force-close:    $( [ "$OPT_KILL" = 1 ] && echo "yes, apps that refuse to quit are ended" || echo "no; if refused, the Mac sleeps instead")"
   echo "Late limit:     $( [ "$OPT_LATE" -gt 0 ] && echo "skipped if it can only start more than $(( OPT_LATE / 60 )) min late (the Mac was asleep)" || echo "none")"
   if [ -n "$KEEP" ]; then echo "Never touched:  $(printf "%s" "${KEEP#|}" | sed "s/|/, /g")"; fi
+  if [ -n "$HOST_NAME" ]; then echo "Assistant app:  $HOST_NAME (asked to quit last; ended if it refuses)"; fi
   echo "Drafts folder:  ${OPT_SAVE_DIR:-$SAVE_ROOT/<date and time the run starts>}"
   echo "Log:            $3"
   echo "Worker:         $2"
@@ -891,7 +939,9 @@ cmd_preview() {
   parse_opts "$@"
   local apps name pid id kind out st dname detail users save_dir
   save_dir="${OPT_SAVE_DIR:-$SAVE_ROOT/<date and time of the run>}"
+  set_host
   say "PREVIEW (read-only; nothing is changed)"
+  say "This assistant runs in: ${HOST_NAME:-(could not tell: not inside an app, e.g. tmux or ssh)}"
   [ -f "$REHEARSAL_FILE" ] && say "!! REHEARSAL MODE is on ($REHEARSAL_FILE): schedules will be dry runs."
   if scheduled_pid >/dev/null; then say "!! A shutdown is already scheduled:"; sed 's/^/   /' "$INFO_FILE" 2>/dev/null; fi
   users=$(who | awk '{print $1}' | sort -u | paste -sd, -)
@@ -907,10 +957,10 @@ cmd_preview() {
     if is_kept "$name" "$id"; then say "- $name: KEPT (--keep): never quit or ended. If it blocks the shutdown, the Mac sleeps instead."; continue; fi
     case "$kind" in
       finder) say "- $name: left to macOS." ;;
-      claude) say "- $name: asked to quit last; if it refuses, it is ended. This closes EVERY Claude session in the app, so other sessions' unfinished work stops." ;;
+      host) say "- $name: the assistant runs here. Asked to quit last; if it refuses, it is ended. This closes EVERY session in the app, so other sessions' unfinished work stops." ;;
       engine) say "- $name: stopped gracefully first (containers get their stop timeouts; restart policies are kept)." ;;
       terminal)
-        say "- $name: asked to quit; $( [ "$OPT_KILL" = 1 ] && echo 'ended after 10 s if it refuses' || echo 'left open if it refuses (--no-kill)'). Running inside it now:"
+        say "- $name: asked to quit; $( [ "$OPT_KILL" = 1 ] && echo 'ended after 10 s if it refuses' || echo 'left open if it refuses (--no-kill)').$( [ -n "$HOST_ID" ] && [ "$id" = "$HOST_ID" ] && echo ' This assistant session runs in it, so closing it ends the session.') Running inside it now:"
         proc_tree "$pid" | sed 's/^/    /' ;;
       doc)
         out=$(run_docs "$id" list "$name" "$save_dir")

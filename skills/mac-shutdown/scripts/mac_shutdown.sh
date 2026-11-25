@@ -25,6 +25,9 @@
 #   -> ask every app to quit -> close terminals (end them if they refuse) -> ask macOS to shut down
 #   -> still on: end the apps that refused (the Claude app among them), ask again -> still on: sleep.
 #
+# If the Mac sleeps before the start time and wakes past --late-limit, the run is skipped. If it sleeps
+# once the steps have begun (a closed lid; caffeinate only stops idle sleep), the run stops when it wakes.
+#
 # A file named REHEARSAL in the state folder turns every schedule into a dry run (for testing the skill).
 
 set -u
@@ -51,10 +54,13 @@ SHUTDOWN_GRACE=150   # seconds to wait for macOS after asking it to shut down
 QUIT_GRACE=60        # seconds for apps to quit after being asked
 TERM_GRACE=15        # seconds between TERM and KILL
 CLAUDE_TERM_GRACE=45 # the Claude app winds its sessions down, so it gets longer before KILL
+SLEEP_GAP=90         # a pause that overruns by this much means the Mac slept (caffeinate only stops idle sleep)
 
 LOG=""
 ECHO=1
 DRY=0
+GUARD=0              # 1 once the shutdown steps have begun: from then on, a sleep stops the run
+SLEPT_MARK="$STATE_DIR/slept-during-run"
 
 # ---------------------------------------------------------------- helpers
 
@@ -74,6 +80,37 @@ alive() { kill -0 "$1" 2>/dev/null; }
 now() { date +%s; }
 fmt_time() { date -r "$1" '+%a %d %b %H:%M:%S'; }
 
+# Sleep for $1 seconds. caffeinate stops idle sleep but not a closed lid, the Sleep menu or a flat
+# battery, so if the pause overran by more than SLEEP_GAP the Mac was asleep: note it in SLEPT_MARK
+# (a file, because many pauses run in subshells) for guard_awake to act on.
+nap() {
+  local before after
+  before=$(now)
+  sleep "$1"
+  after=$(now)
+  if [ "$GUARD" = 1 ] && [ $(( after - before )) -gt $(( $1 + SLEEP_GAP )) ]; then
+    printf '%s: a %s-second pause took %s seconds\n' "$(ts)" "$1" "$(( after - before ))" >> "$SLEPT_MARK"
+  fi
+  return 0
+}
+
+# A notification in the corner of the screen. Arguments: title, text.
+notify() {
+  with_timeout 15 osascript -e 'on run argv' -e 'display notification (item 2 of argv) with title (item 1 of argv)' \
+    -e 'end run' "$1" "$2" >/dev/null 2>&1
+}
+
+# Between steps: if the Mac slept while the shutdown was under way, stop for good. Whoever wakes it
+# is probably about to use it, and the later steps end apps and shut down.
+guard_awake() {
+  [ "$GUARD" = 1 ] && [ -s "$SLEPT_MARK" ] || return 0
+  log "ABORTED: the Mac was asleep during the shutdown ($(tail -n 1 "$SLEPT_MARK")). Stopping here so nothing is closed under someone who has just woken it. The steps logged above had already run."
+  if [ "$DRY" != 1 ]; then
+    notify "Scheduled shutdown stopped" "The Mac went to sleep partway through the shutdown, so it was stopped when the Mac woke. See the log in $STATE_DIR."
+  fi
+  finish 0
+}
+
 # Run a command, killing it after $1 seconds (macOS has no timeout(1)). Returns 124 on timeout.
 with_timeout() {
   local secs=$1 pid end
@@ -87,7 +124,7 @@ with_timeout() {
       wait "$pid" 2>/dev/null
       return 124
     fi
-    sleep 1
+    nap 1
   done
   wait "$pid"
 }
@@ -151,7 +188,7 @@ end_process() {
   log "  ending $name (pid $pid) with TERM; it has ${grace}s to close by itself"
   kill -TERM "$pid" 2>/dev/null
   i=0
-  while alive "$pid" && [ $i -lt "$grace" ]; do sleep 1; i=$((i + 1)); done
+  while alive "$pid" && [ $i -lt "$grace" ]; do nap 1; i=$((i + 1)); done
   if alive "$pid"; then
     log "  $name did not close within ${grace}s of TERM; sending KILL"
     kill -KILL "$pid" 2>/dev/null
@@ -351,6 +388,7 @@ on_term() {
 }
 
 cleanup() {
+  rm -f "$SLEPT_MARK"
   if [ "$DRY" != 1 ] && [ -f "$PID_FILE" ] && [ "$(cut -d' ' -f1 "$PID_FILE" 2>/dev/null)" = "$$" ]; then
     rm -f "$PID_FILE" "$INFO_FILE"
   fi
@@ -382,10 +420,12 @@ phase_wait() {
   if [ "$MS_LATE" -gt 0 ] && [ "$late" -gt "$MS_LATE" ]; then
     log "SKIPPED: the run only got going $(( late / 60 )) min after its start time, past the $(( MS_LATE / 60 )) min late limit (the Mac was probably asleep). Nothing was shut down."
     if [ "$DRY" != 1 ]; then
-      with_timeout 15 osascript -e "display notification \"The shutdown planned for $(fmt_time "$target") was skipped because the Mac was asleep at that time.\" with title \"Scheduled shutdown skipped\"" >/dev/null 2>&1
+      notify "Scheduled shutdown skipped" "The shutdown planned for $(fmt_time "$target") was skipped because the Mac was asleep at that time."
     fi
     finish 0
   fi
+  # From here on the steps change things, so a sleep in the middle of them stops the run (guard_awake).
+  GUARD=1
 }
 
 phase_warn() {
@@ -420,7 +460,7 @@ phase_engines() {
       with_timeout 330 docker desktop stop --timeout 300 >> "$LOG" 2>&1
       if docker_running; then
         log "Docker Desktop is still running; asking the app to quit"
-        quit_app_async com.docker.docker 60; sleep 45
+        quit_app_async com.docker.docker 60; nap 45
       fi
       if docker_running; then log "Docker Desktop is STILL running; the shutdown will stop it"; else log "Docker Desktop has stopped"; fi
     fi
@@ -430,7 +470,7 @@ phase_engines() {
     if [ "$DRY" = 1 ]; then log "[dry run] would stop OrbStack (orbctl stop, else quit the app)"
     else
       log "OrbStack is running; stopping it"
-      if command -v orbctl >/dev/null 2>&1; then with_timeout 300 orbctl stop >> "$LOG" 2>&1; else quit_app_async dev.kdrag0n.MacVirt 120; sleep 60; fi
+      if command -v orbctl >/dev/null 2>&1; then with_timeout 300 orbctl stop >> "$LOG" 2>&1; else quit_app_async dev.kdrag0n.MacVirt 120; nap 60; fi
     fi
   fi
   if command -v colima >/dev/null 2>&1 && colima status >/dev/null 2>&1; then
@@ -501,7 +541,7 @@ EOF
     local left=0 p
     for p in $waiting; do alive "$p" && left=1; done
     [ $left = 0 ] && break
-    sleep 2; i=$((i + 2))
+    nap 2; i=$((i + 2))
   done
   # Names may contain spaces, so look each pid up again rather than splitting the list.
   while IFS="$TAB" read -r name pid id; do
@@ -531,7 +571,8 @@ phase_terminals() {
     log "asking $name to quit"
     quit_app_async "$id" 15
     local i=0
-    while alive "$pid" && [ $i -lt 10 ]; do sleep 1; i=$((i + 1)); done
+    while alive "$pid" && [ $i -lt 10 ]; do nap 1; i=$((i + 1)); done
+    guard_awake
     if alive "$pid"; then
       if [ "$MS_KILL" = 1 ]; then end_process "$pid" "$name"
       else log "$name is still open (--no-kill); it may block the shutdown"; fi
@@ -555,7 +596,7 @@ attempt_shutdown() {
     # already quit drops the connection: both mean the earlier request is going through.
     *-10827*|*-609*) log "  that error is expected: macOS is already shutting down (an earlier request went through once the app holding it up ended)" ;;
   esac
-  while [ $waited -lt $SHUTDOWN_GRACE ]; do sleep 5; waited=$((waited + 5)); done
+  while [ $waited -lt $SHUTDOWN_GRACE ]; do nap 5; guard_awake; waited=$((waited + 5)); done
   log "the Mac is still on ${SHUTDOWN_GRACE}s after attempt $n: an app refused the shutdown or is still holding it up"
   log "apps still open: $(list_apps | cut -f1 | paste -sd, - | sed 's/,/, /g')"
   return 1
@@ -568,6 +609,7 @@ phase_force() {
   apps=$(list_apps)
   while IFS="$TAB" read -r name pid id; do
     [ -n "$name" ] || continue
+    guard_awake
     kind=$(app_kind "$id")
     [ "$kind" = finder ] && continue
     if is_kept "$name" "$id"; then log "$name: kept (--keep); not ended"; continue; fi
@@ -578,7 +620,7 @@ phase_force() {
     fi
     if [ "$kind" = claude ]; then
       log "asking the Claude app to quit (it usually refuses while shutting down)"
-      quit_app_async "$id" 25; sleep 20
+      quit_app_async "$id" 25; nap 20
     fi
     if alive "$pid"; then
       if [ "$kind" = claude ]; then end_process "$pid" "$name" "$CLAUDE_TERM_GRACE"
@@ -600,6 +642,7 @@ phase_sleep() {
 worker() {
   LOG=$MS_LOG; DRY=$MS_DRY; ECHO=$MS_DRY; KEEP=$MS_KEEP; MS_LATE=${MS_LATE:-1800}
   trap on_term TERM INT
+  rm -f "$SLEPT_MARK"
   if [ "$DRY" != 1 ]; then
     printf '%s %s\n' "$$" "$(ps -o pgid= -p $$ | tr -d ' ')" > "$PID_FILE"
   fi
@@ -611,13 +654,13 @@ worker() {
     else MS_SAVE_DIR="$SAVE_ROOT/$(date '+%Y-%m-%d %H.%M')"; fi
   fi
   log "never-saved drafts go to: $MS_SAVE_DIR"
-  phase_warn
-  phase_engines
-  phase_save
-  phase_quit
-  phase_terminals
+  phase_warn;       guard_awake
+  phase_engines;    guard_awake
+  phase_save;       guard_awake
+  phase_quit;       guard_awake
+  phase_terminals;  guard_awake
   attempt_shutdown 1 && finish 0
-  phase_force
+  phase_force;      guard_awake
   attempt_shutdown 2 && finish 0
   phase_sleep
   finish 0

@@ -147,6 +147,27 @@ FAKE_OSA_OUT=""; FAKE_OSA_RC=0
 n=$(log_lines); attempt_shutdown 1
 lacks "a clean answer gets no error note" "that error is expected" "$(log_since "$n")"
 
+# ---------------------------------------------------------------- the Mac sleeping before or during a run
+# A fake clock: each "sleep" moves it on by an hour, as a closed lid would.
+rm -f "$SLEPT_MARK"
+( GUARD=1; FAKE_T=1000; now() { echo "$FAKE_T"; }; sleep() { FAKE_T=$(( FAKE_T + 3600 )); }; nap 5 )
+contains "a pause that overran by an hour is recorded as a sleep" "a 5-second pause took 3600 seconds" "$(cat "$SLEPT_MARK" 2>/dev/null)"
+n=$(log_lines); ( GUARD=1; DRY=1; guard_awake; log "carried on" )
+out=$(log_since "$n")
+contains "after a sleep mid-run, the run stops" "ABORTED: the Mac was asleep during the shutdown" "$out"
+lacks "and none of the later steps run" "carried on" "$out"
+check "and the record of the sleep is cleared" "" "$(cat "$SLEPT_MARK" 2>/dev/null)"
+( GUARD=0; FAKE_T=1000; now() { echo "$FAKE_T"; }; sleep() { FAKE_T=$(( FAKE_T + 3600 )); }; nap 5 )
+check "before the steps begin, a long pause is left to the late limit" "" "$(cat "$SLEPT_MARK" 2>/dev/null)"
+( GUARD=1; nap 1 )
+check "a normal pause is not taken for a sleep" "" "$(cat "$SLEPT_MARK" 2>/dev/null)"
+check "with no sleep, the run carries on" "continued" "$( ( GUARD=1; guard_awake; echo continued ) )"
+n=$(log_lines); ( DRY=1; MS_AFTER_PID=""; MS_DELAY=0; MS_LATE=1800; MS_TARGET=$(( $(date +%s) - 7200 )); phase_wait; log "carried on" )
+out=$(log_since "$n")
+contains "a run that can only start 2 h late is skipped" "SKIPPED: the run only got going 120 min after its start time" "$out"
+lacks "and nothing else happens" "carried on" "$out"
+check "an on-time run arms the sleep guard" "GUARD=1" "$( ( DRY=1; MS_AFTER_PID=""; MS_DELAY=0; MS_LATE=1800; MS_TARGET=$(date +%s); phase_wait; echo "GUARD=$GUARD" ) | tail -n 1)"
+
 # ---------------------------------------------------------------- the command line, as a separate process
 # Each of these is rejected before anything starts; REHEARSAL in the state folder is a second guard.
 for args in "--in 5x" "--at 25:00" "--warn abc" "--after-pid abc" "--late-limit 1x" "--bogus"; do

@@ -144,7 +144,7 @@ warn=120
 save_dir=~/Documents/Drafts
 ```
 
-Settings: `in`, `warn`, `late_limit`, `keep` (repeatable), `no_kill` (`yes` or `no`) and `save_dir`. Run `mac_shutdown.sh doctor` to check the file.
+Settings: `in`, `warn`, `late_limit`, `keep` (repeatable), `no_kill` (`yes` or `no`) and `save_dir` (an absolute path, or one starting with `~/`). Quotes around a value are optional. Run `mac_shutdown.sh doctor` to check the file.
 
 ## What can be lost
 
@@ -167,7 +167,7 @@ Limits:
 
 ## Testing
 
-- `bash tests/run.sh`: 108 safe unit tests. They fake `osascript`, `pmset`, `docker`, the clock and the process list, and only ever end dummy processes they started themselves, so nothing on your Mac is touched. CI runs them on macOS on every push, plus ShellCheck.
+- `bash tests/run.sh`: 132 safe unit tests. They fake `osascript`, `pmset`, `docker`, the clock and the process list, and only ever end dummy processes they started themselves, so nothing on your Mac is touched. CI runs them on macOS on every push, plus ShellCheck.
 - `mac_shutdown.sh schedule --dry-run`: runs every step against your real apps, read-only.
 - **Rehearsal switch:** while a file named `REHEARSAL` exists in `~/Library/Logs/mac-shutdown/`, every `schedule` becomes a dry run. Use it to test the skill end to end with your agent without turning anything off, and delete it afterwards.
 - `evals/`: two test cases that compare an agent with and without the skill. Run them with `claude plugin eval .` from the repo root, with the rehearsal switch on.

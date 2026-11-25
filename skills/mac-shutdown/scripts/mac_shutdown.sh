@@ -70,7 +70,7 @@ DRY=0
 GUARD=0              # 1 once the shutdown steps have begun: from then on, a sleep stops the run
 HOST_ID=${MS_HOST_ID:-}     # the app this assistant session runs in (set_host), passed on to the worker
 HOST_NAME=${MS_HOST_NAME:-}
-SLEPT_MARK="$STATE_DIR/slept-during-run"
+SLEPT_MARK="$STATE_DIR/slept-during-run.$$"   # $$ is the same in subshells, so per worker
 
 # ---------------------------------------------------------------- helpers
 
@@ -213,14 +213,18 @@ is_kept() {
 }
 
 # Hide what looks like a password, token or key in command lines (stdin to stdout, the first field kept as
-# is): --password X, --token=X, API_KEY=X, Authorization: Bearer X, user:pass@ in URLs, ?token=X, mysql -pX,
-# redis-cli -a X, sshpass -p X, and long random-looking strings. The preview and the log are read back
+# is): --password X, --token=X, PGPASSWORD=X, Authorization: Bearer X, X-Api-Key: X, Cookie: X, -u user:X,
+# user:pass@ in URLs, ?token=X, mysql -pX, redis-cli -a X, sshpass -p X, and long random-looking strings.
+# Run it on whole command lines: cut them short only afterwards, or a cut secret slips past the patterns. The preview and the log are read back
 # into the assistant's conversation, so secrets must not reach them.
 redact_secrets() {
   awk '
-    function secret(k) {
+    function strong(k) {   # secret whatever comes before it: pgpassword, secret_key, x-api-key
+      return k ~ /(password|passwd|passphrase|token|secret|secret[-_]?key|api[-_]?key|apikey|private[-_]?key|access[-_]?key|credentials?)$/
+    }
+    function secret(k) {   # short names only as a whole word: --pass, db_pwd, --auth (not --bypass)
       k = tolower(k); sub(/^-+/, "", k)
-      return k ~ /^([a-z0-9]+[-_])*(pass|password|passwd|pwd|token|secret|api[-_]?key|apikey|access[-_]?key|auth|credentials?)$/
+      return strong(k) || k ~ /^([a-z0-9]+[-_])*(pass|pwd|auth)$/
     }
     function query(w,   q, n, p, j, e, out) {
       q = index(w, "?"); if (q == 0) return w
@@ -233,12 +237,17 @@ redact_secrets() {
       return out
     }
     {
-      n = split($0, f, " "); out = f[1]; hide = 0; auth = 0; db = ($0 ~ /mysql|mariadb/); short = ($0 ~ /redis-cli/ ? "-a" : ($0 ~ /sshpass/ ? "-p" : ""))
+      n = split($0, f, " "); out = f[1]; hide = 0; auth = 0; user = 0
+      db = ($0 ~ /mysql|mariadb/); short = ($0 ~ /redis-cli/ ? "-a" : ($0 ~ /sshpass/ ? "-p" : ""))
       for (i = 2; i <= n; i++) {
         w = f[i]; lw = tolower(w)
         if (hide) { w = "***"; hide = 0 }
         else if (auth) { auth = 0; if (lw ~ /^(bearer|basic|token|digest)$/) hide = 1; else w = "***" }
-        else if (lw == "authorization:" || lw == "bearer") { if (lw == "bearer") hide = 1; else auth = 1 }
+        else if (user) { user = 0; c = index(w, ":"); if (c > 0) w = substr(w, 1, c) "***" }
+        else if (lw == "authorization:" || lw == "proxy-authorization:") auth = 1
+        else if (lw == "bearer") hide = 1
+        else if (w ~ /:$/ && (lw == "cookie:" || secret(substr(w, 1, length(w) - 1)))) hide = 1
+        else if (w == "-u" || w == "--user" || w == "--proxy-user") user = 1
         else if (w ~ /^-/ && index(w, "=") == 0 && secret(w)) hide = 1
         else if (w ~ /^-?-?[A-Za-z_][A-Za-z0-9_-]*=/ && secret(substr(w, 1, index(w, "=") - 1))) w = substr(w, 1, index(w, "=")) "***"
         else if (db && w ~ /^-p[^0-9-]/) w = "-p***"
@@ -260,8 +269,8 @@ proc_tree() {
     END {
       inset[root] = 1; changed = 1
       while (changed) { changed = 0; for (p in par) if (!(p in inset) && (par[p] in inset)) { inset[p] = 1; changed = 1 } }
-      for (p in inset) if (p != root) print p " " substr(cmd[p], 1, 150)
-    }' | sort -n | head -25 | redact_secrets
+      for (p in inset) if (p != root) print p " " cmd[p]
+    }' | sort -n | head -25 | redact_secrets | cut -c1-160
 }
 
 quit_app_async() {   # bundle id (or name), seconds. The target is passed as an argument, so any name is safe.
@@ -282,6 +291,7 @@ end_process() {
   i=0
   while alive "$pid" && [ $i -lt "$grace" ]; do nap 1; i=$((i + 1)); done
   if alive "$pid"; then
+    guard_awake   # a sleep during the TERM wait: stop rather than KILL right after someone wakes the Mac
     log "  $name did not close within ${grace}s of TERM; sending KILL"
     kill -KILL "$pid" 2>/dev/null
     sleep 2
@@ -492,7 +502,7 @@ START_AT=0
 phase_wait() {
   local target=$MS_TARGET
   if [ -n "$MS_AFTER_PID" ]; then
-    log "waiting for process $MS_AFTER_PID to finish: $(ps -o command= -p "$MS_AFTER_PID" 2>/dev/null | cut -c1-100)"
+    log "waiting for process $MS_AFTER_PID to finish: $(ps -o command= -p "$MS_AFTER_PID" 2>/dev/null | sed 's/^/- /' | redact_secrets | cut -c3-102)"
     if [ "$DRY" = 1 ]; then log "[dry run] not waiting"
     else while alive "$MS_AFTER_PID"; do sleep 5; done; fi
     log "process $MS_AFTER_PID has finished"
@@ -618,7 +628,12 @@ phase_quit() {
   while IFS="$TAB" read -r name pid id; do
     [ -n "$name" ] || continue
     kind=$(app_kind "$id")
-    case "$kind" in finder|host|terminal) continue ;; esac
+    case "$kind" in
+      finder|terminal) continue ;;
+      # The agent's app is asked last, in the force step. With --no-kill there is none, so an app other
+      # than Claude is asked here like any other (as in 1.x); Claude itself only gets macOS's request.
+      host) if [ "$MS_KILL" = 1 ] || in_list "$id" "$KNOWN_HOST_IDS"; then continue; fi ;;
+    esac
     if is_kept "$name" "$id"; then log "$name: kept (--keep); not asked to quit"; continue; fi
     if [ "$DRY" = 1 ]; then log "[dry run] would ask $name to quit"; continue; fi
     log "asking $name to quit"
@@ -713,7 +728,7 @@ phase_force() {
     fi
     if [ "$kind" = host ]; then
       log "asking $name, where the assistant runs, to quit (it often refuses while shutting down)"
-      quit_app_async "$id" 25; nap 20
+      quit_app_async "$id" 25; nap 20; guard_awake
     fi
     if alive "$pid"; then
       if [ "$kind" = host ]; then end_process "$pid" "$name" "$HOST_TERM_GRACE"
@@ -765,10 +780,10 @@ worker() {
 parse_duration() {   # 90, 90s, 5m, 2h -> seconds
   printf '%s' "$1" | grep -qE '^[0-9]+[smh]?$' || die "bad duration: $1 (use 90s, 5m or 2h)"
   case "$1" in
-    *h) echo $(( ${1%h} * 3600 )) ;;
-    *m) echo $(( ${1%m} * 60 )) ;;
-    *s) echo "${1%s}" ;;
-    *) echo "$1" ;;
+    *h) echo $(( 10#${1%h} * 3600 )) ;;   # 10#: "08" is eight, not a bad octal number
+    *m) echo $(( 10#${1%m} * 60 )) ;;
+    *s) echo $(( 10#${1%s} )) ;;
+    *) echo $(( 10#$1 )) ;;
   esac
 }
 
@@ -796,6 +811,19 @@ scheduled_pid() {   # prints the worker pid if one is alive
 
 OPT_LATE=1800 OPT_DELAY=120 OPT_AT="" OPT_AT_EPOCH="" OPT_AFTER_PID="" OPT_WARN=60 OPT_KILL=1 OPT_SAVE_DIR="" OPT_DRY=0 OPT_REPLACE=0
 
+# A drafts folder as an absolute path: ~ and $HOME are expanded, anything relative is refused (the worker's
+# working folder is wherever the agent ran, and AppleScript would read a relative path differently).
+abs_dir() {
+  local d=$1
+  case "$d" in
+    "~") d=$HOME ;;
+    "~"/*) d="$HOME/${d#"~/"}" ;;
+    '$HOME') d=$HOME ;;
+    '$HOME'/*) d="$HOME/${d#'$HOME/'}" ;;
+  esac
+  case "$d" in /*) printf '%s' "$d" ;; *) return 1 ;; esac
+}
+
 # Defaults from the config file: key=value lines, # for comments. Flags given on the command line win.
 load_config() {
   local line key value n=0
@@ -810,6 +838,10 @@ load_config() {
     esac
     key=$(printf '%s' "${line%%=*}" | tr -d '[:space:]')
     value=$(printf '%s' "${line#*=}" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+    case "$value" in   # keep="Google Chrome" means the app, without the quotes
+      \"*\") value=${value#\"}; value=${value%\"} ;;
+      \'*\') value=${value#\'}; value=${value%\'} ;;
+    esac
     case "$key" in
       in) OPT_DELAY=$(parse_duration "$value") || exit 2 ;;
       warn) case "$value" in ''|*[!0-9]*) die "$CONFIG_FILE line $n: warn needs a number of seconds" ;; esac
@@ -821,8 +853,7 @@ load_config() {
                  no|false|0) OPT_KILL=1 ;;
                  *) die "$CONFIG_FILE line $n: no_kill is yes or no" ;;
                esac ;;
-      save_dir) case "$value" in "~"/*) value="$HOME/${value#"~/"}" ;; esac
-                OPT_SAVE_DIR=$value ;;
+      save_dir) OPT_SAVE_DIR=$(abs_dir "$value") || die "$CONFIG_FILE line $n: save_dir must be an absolute path, or start with ~/" ;;
       *) die "$CONFIG_FILE line $n: unknown setting '$key' (use in, warn, late_limit, keep, no_kill or save_dir)" ;;
     esac
   done < "$CONFIG_FILE"
@@ -849,6 +880,8 @@ parse_opts() {
     shift
   done
   case "$OPT_WARN" in *[!0-9]*|"") die "--warn needs a number of seconds" ;; esac
+  OPT_WARN=$(( 10#$OPT_WARN ))   # "08" would otherwise break the arithmetic and silently skip the warning
+  if [ -n "$OPT_SAVE_DIR" ]; then OPT_SAVE_DIR=$(abs_dir "$OPT_SAVE_DIR") || die "--save-dir needs an absolute path, or one starting with ~/"; fi
   case "$OPT_DELAY" in *[!0-9]*|"") die "--in gave no usable duration" ;; esac
   if [ -n "$OPT_AT" ]; then OPT_AT_EPOCH=$(parse_at "$OPT_AT") || exit 2; fi
   if [ -n "$OPT_AFTER_PID" ]; then
@@ -917,7 +950,11 @@ schedule_summary() {   # start epoch, worker text, log path
   echo "Force-close:    $( [ "$OPT_KILL" = 1 ] && echo "yes, apps that refuse to quit are ended" || echo "no; if refused, the Mac sleeps instead")"
   echo "Late limit:     $( [ "$OPT_LATE" -gt 0 ] && echo "skipped if it can only start more than $(( OPT_LATE / 60 )) min late (the Mac was asleep)" || echo "none")"
   if [ -n "$KEEP" ]; then echo "Never touched:  $(printf "%s" "${KEEP#|}" | sed "s/|/, /g")"; fi
-  if [ -n "$HOST_NAME" ]; then echo "Assistant app:  $HOST_NAME (asked to quit last; ended if it refuses)"; fi
+  if [ -n "$HOST_NAME" ]; then
+    if in_list "$HOST_ID" "$TERMINAL_IDS"; then echo "Assistant app:  $HOST_NAME (a terminal: closed with the others, which ends this session)"
+    elif [ "$OPT_KILL" = 1 ]; then echo "Assistant app:  $HOST_NAME (asked to quit last; ended if it refuses)"
+    else echo "Assistant app:  $HOST_NAME (never forced closed: --no-kill)"; fi
+  fi
   echo "Drafts folder:  ${OPT_SAVE_DIR:-$SAVE_ROOT/<date and time the run starts>}"
   echo "Log:            $3"
   echo "Worker:         $2"
@@ -1000,7 +1037,9 @@ cmd_preview() {
     if is_kept "$name" "$id"; then say "- $name: KEPT (--keep): never quit or ended. If it blocks the shutdown, the Mac sleeps instead."; continue; fi
     case "$kind" in
       finder) say "- $name: left to macOS." ;;
-      host) say "- $name: the assistant runs here. Asked to quit last; if it refuses, it is ended. This closes EVERY session in the app, so other sessions' unfinished work stops." ;;
+      host)
+        if [ "$OPT_KILL" = 1 ]; then say "- $name: the assistant runs here. Asked to quit last; if it refuses, it is ended. This closes EVERY session in the app, so other sessions' unfinished work stops."
+        else say "- $name: the assistant runs here. Never forced closed (--no-kill); if it refuses to quit, the Mac sleeps instead."; fi ;;
       engine) say "- $name: stopped gracefully first (containers get their stop timeouts; restart policies are kept)." ;;
       terminal)
         say "- $name: asked to quit; $( [ "$OPT_KILL" = 1 ] && echo 'ended after 10 s if it refuses' || echo 'left open if it refuses (--no-kill)').$( [ -n "$HOST_ID" ] && [ "$id" = "$HOST_ID" ] && echo ' This assistant session runs in it, so closing it ends the session.') Running inside it now:"

@@ -285,6 +285,51 @@ FAKE_OSA_OUT="execution error: Not authorized to send Apple events to System Eve
 contains "doctor explains a missing permission" "Allow Claude to control System Events" "$(HOST_NAME=Claude HOST_ID=x cmd_doctor 2>&1)"
 FAKE_OSA_OUT=""; FAKE_OSA_RC=0
 
+# ---------------------------------------------------------------- fixes from the 2.0 review
+r=$(printf '%s\n' "1 env PGPASSWORD=pg9 psql" "2 app SECRET_KEY=sk9 --secret-key sk8" "3 gpg --passphrase pp9" \
+  "4 curl -u admin:pw9 -H X-Api-Key: ak9 -H Cookie: sid=ck9 https://x" "5 llm --max-tokens 100 -u root" | redact_secrets)
+for secret in pg9 sk9 sk8 pp9 pw9 ak9 ck9; do lacks "also hidden: $secret" "$secret" "$r"; done
+contains "-u keeps the user name" "-u admin:***" "$r"
+contains "a token count and a plain user stay readable" "llm --max-tokens 100 -u root" "$r"
+# A command long enough that a cut at 160 characters would land inside the secret if it came first.
+bash -c 'sleep 30; :' "$(printf '%0105d' 0)" "postgres://app:XYZZYsupersecret@db/x" & child=$!
+sleep 1
+out=$(proc_tree $$ | grep 'sleep 30; :')
+lacks "a long command line is redacted before it is cut short" "XYZZY" "$out"
+kill "$child" 2>/dev/null; wait "$child" 2>/dev/null
+check "durations with a leading zero" 480 "$(parse_duration 08m)"
+check "--warn with a leading zero is still a warning" 8 "$( parse_opts --warn 08; echo "$OPT_WARN" )"
+printf '%s\n' 'keep="Google Chrome"' "keep='Music'" 'save_dir=~' > "$CONFIG_FILE"
+check "quotes around config values are dropped" "|Google Chrome|Music $HOME" "$( parse_opts; echo "$KEEP $OPT_SAVE_DIR" )"
+printf '%s\n' "save_dir=Documents/Drafts" > "$CONFIG_FILE"
+contains "a relative save_dir is refused" "save_dir must be an absolute path" "$( ( parse_opts ) 2>&1 )"
+rm -f "$CONFIG_FILE"
+contains "so is a relative --save-dir" "--save-dir needs an absolute path" "$( ( parse_opts --save-dir drafts ) 2>&1 )"
+check "--save-dir expands \$HOME" "$HOME/x" "$( parse_opts --save-dir '$HOME/x'; echo "$OPT_SAVE_DIR" )"
+case "$SLEPT_MARK" in *".$$") ok "each worker has its own sleep record" ;; *) bad "each worker has its own sleep record" "$SLEPT_MARK" ;; esac
+bash -c 'trap "" TERM; while :; do sleep 1; done' & stubborn=$!
+sleep 1
+echo "test: slept" > "$SLEPT_MARK"
+n=$(log_lines); ( GUARD=1; DRY=1; end_process "$stubborn" stubborn-dummy 1 )
+out=$(log_since "$n")
+contains "a sleep during the TERM wait stops the run before KILL" "ABORTED" "$out"
+lacks "so nothing is KILLed after a wake" "sending KILL" "$out"
+if alive "$stubborn"; then ok "and the app is left alone"; else bad "and the app is left alone" "pid $stubborn was killed"; fi
+kill -KILL "$stubborn" 2>/dev/null; wait "$stubborn" 2>/dev/null; rm -f "$SLEPT_MARK"
+sleep 60 & ide=$!
+quit_asked() {   # --kill or --no-kill (1 or 0), app name, bundle id: did the quit step ask the app to quit?
+  local force=$1 app=$2 bid=$3   # the fake list_apps below sees these, not its own (empty) arguments
+  n=$(log_lines)
+  ( list_apps() { printf '%s\t%s\t%s\n' "$app" "$ide" "$bid"; }; osascript() { :; }
+    HOST_ID=$bid; DRY=0; MS_KILL=$force; QUIT_GRACE=2; GUARD=0; phase_quit ) >/dev/null 2>&1
+  case "$(log_since "$n")" in *"asking $app to quit"*) echo yes ;; *) echo no ;; esac
+}
+check "the fake app list really lists the app" "Cursor" "$( app=Cursor; ide=1; bid=x; list_apps() { printf '%s\t%s\t%s\n' "$app" "$ide" "$bid"; }; list_apps | cut -f1 )"
+check "the agent's app is not asked in the quit step (it goes last)" no "$(quit_asked 1 Cursor com.todesktop.cursor)"
+check "with --no-kill, an agent app other than Claude is asked like any other app" yes "$(quit_asked 0 Cursor com.todesktop.cursor)"
+check "with --no-kill, the Claude app is still left to macOS's request" no "$(quit_asked 0 Claude com.anthropic.claudefordesktop)"
+kill "$ide" 2>/dev/null; wait "$ide" 2>/dev/null
+
 # ---------------------------------------------------------------- the command line, as a separate process
 # Each of these is rejected before anything starts; REHEARSAL in the state folder is a second guard.
 for args in "--in 5x" "--at 25:00" "--warn abc" "--after-pid abc" "--late-limit 1x" "--bogus"; do

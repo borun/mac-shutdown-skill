@@ -563,7 +563,7 @@ attempt_shutdown() {
 
 phase_force() {
   log "--- step: end the apps that refused"
-  local apps name pid id kind targets=""
+  local apps name pid id kind
   if [ "$MS_KILL" != 1 ]; then log "--no-kill: nothing is forced closed"; return 0; fi
   apps=$(list_apps)
   while IFS="$TAB" read -r name pid id; do

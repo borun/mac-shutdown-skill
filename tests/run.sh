@@ -10,6 +10,9 @@
 #
 # Run: bash tests/run.sh
 
+# ECHO, KEEP and SHUTDOWN_GRACE are set here and read by the sourced script.
+# shellcheck disable=SC2034
+
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT="$HERE/../scripts/mac_shutdown.sh"

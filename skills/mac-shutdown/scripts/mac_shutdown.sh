@@ -28,7 +28,7 @@
 # The ladder, once the wait is over:
 #   warning with Cancel -> stop Docker/OrbStack/Colima -> save drafts in TextEdit, Pages, Numbers, Keynote
 #   -> ask every app to quit -> close terminals (end them if they refuse) -> ask macOS to shut down
-#   -> still on: end the apps that refused (the Claude app among them), ask again -> still on: sleep.
+#   -> still on: end the apps that refused (the agent's app among them), ask again -> still on: sleep.
 #
 # If the Mac sleeps before the start time and wakes past --late-limit, the run is skipped. If it sleeps
 # once the steps have begun (a closed lid; caffeinate only stops idle sleep), the run stops when it wakes.
@@ -895,7 +895,7 @@ cmd_schedule() {
   : > "$MS_LOG"
   ln -sf "$MS_LOG" "$STATE_DIR/latest.log"
   rm -f "$CANCEL_MARK"
-  # Detach: a new session (survives the Claude app closing), no hang-up, and no idle sleep while waiting.
+  # Detach: a new session (survives the agent's app closing), no hang-up, and no idle sleep while waiting.
   /usr/bin/perl -MPOSIX -e 'POSIX::setsid() or warn "setsid: $!\n"; exec @ARGV or die "exec: $!\n"' \
     /usr/bin/nohup /usr/bin/caffeinate -i /bin/bash "$SELF" _worker < /dev/null >> "$MS_LOG" 2>&1 &
   local i=0 wpid=""

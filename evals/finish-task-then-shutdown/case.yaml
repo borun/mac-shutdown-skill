@@ -1,0 +1,4 @@
+schema_version: "1.1"
+name: finish-task-then-shutdown
+expected_outcome: |
+  The note is written first; open apps are previewed; then a detached shutdown is scheduled that stops Docker gracefully, closes or ends blocking apps and terminals, retries, and falls back to sleep; the user is told the log path and how to cancel.

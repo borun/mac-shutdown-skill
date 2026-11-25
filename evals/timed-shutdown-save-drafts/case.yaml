@@ -1,0 +1,4 @@
+schema_version: "1.1"
+name: timed-shutdown-save-drafts
+expected_outcome: |
+  A shutdown is scheduled for 01:30 local time the next time it comes round (tomorrow if 01:30 has already passed today), with the date stated; open TextEdit drafts are saved first into a named folder whose path the user is told, along with the log path and how to cancel.
